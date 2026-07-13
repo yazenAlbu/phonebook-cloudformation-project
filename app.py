@@ -52,6 +52,15 @@ def get_db_connection():
     return pymysql.connect(**DB_CONFIG)
 
 
+def format_person(record):
+    """Convert a database record into a display-ready dictionary."""
+    return {
+        "id": record["id"],
+        "name": record["name"].strip().title(),
+        "number": record["number"],
+    }
+
+
 def find_persons(keyword):
     """Find phonebook records containing the supplied name."""
     search_value = f"%{keyword.strip().lower()}%"
@@ -70,15 +79,7 @@ def find_persons(keyword):
             )
 
             records = cursor.fetchall()
-
-            return [
-                {
-                    "id": record["id"],
-                    "name": record["name"].strip().title(),
-                    "number": record["number"],
-                }
-                for record in records
-            ]
+            return [format_person(record) for record in records]
     finally:
         connection.close()
 
@@ -103,11 +104,7 @@ def get_person_by_id(person_id):
             if record is None:
                 return None
 
-            return {
-                "id": record["id"],
-                "name": record["name"].strip().title(),
-                "number": record["number"],
-            }
+            return format_person(record)
     finally:
         connection.close()
 
@@ -179,6 +176,25 @@ def update_person(person_id, name, number):
                     person_id,
                 ),
             )
+    finally:
+        connection.close()
+
+
+def delete_person(person_id):
+    """Delete a phonebook contact by its database ID."""
+    connection = get_db_connection()
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM phonebook
+                WHERE id = %s;
+                """,
+                (person_id,),
+            )
+
+            return cursor.rowcount
     finally:
         connection.close()
 
@@ -372,6 +388,49 @@ def update_contact(person_id):
         "add-update.html",
         page_title="Update Contact",
         button_text="Save Changes",
+        person=person,
+        error_message=None,
+        developer_name=DEVELOPER_NAME,
+    )
+
+
+@app.route("/delete/<int:person_id>", methods=["GET", "POST"])
+def delete_contact(person_id):
+    """Display a confirmation page and delete a contact."""
+    try:
+        person = get_person_by_id(person_id)
+    except pymysql.MySQLError:
+        app.logger.exception("Loading the contact for deletion failed.")
+        abort(500)
+
+    if person is None:
+        abort(404)
+
+    if request.method == "POST":
+        try:
+            deleted_rows = delete_person(person_id)
+        except pymysql.MySQLError:
+            app.logger.exception("Deleting the contact failed.")
+
+            return render_template(
+                "delete.html",
+                person=person,
+                error_message="The contact could not be deleted.",
+                developer_name=DEVELOPER_NAME,
+            ), 500
+
+        if deleted_rows == 0:
+            abort(404)
+
+        flash(
+            f"{person['name']} was deleted successfully.",
+            "success",
+        )
+
+        return redirect(url_for("home"))
+
+    return render_template(
+        "delete.html",
         person=person,
         error_message=None,
         developer_name=DEVELOPER_NAME,
