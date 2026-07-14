@@ -1,0 +1,329 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Stage 1 of the Phonebook project: one public EC2 instance running
+  Flask/Gunicorn behind Nginx, connected to a private Amazon RDS MySQL database.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for the EC2 instance and RDS database.
+
+  PublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet for the EC2 instance.
+
+  DBSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two subnets in different Availability Zones for RDS.
+
+  GitRepoUrl:
+    Type: String
+    Default: https://github.com/yazenAlbu/phonebook-cloudformation-project.git
+    Description: Public Git repository containing the Flask application.
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues:
+      - db.t3.micro
+      - db.t4g.micro
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+
+Resources:
+  FlaskSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Secret key used by the Flask application.
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+      Tags:
+        - Key: Project
+          Value: phonebook-cloudformation-project
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP access to the Phonebook EC2 instance.
+      VpcId:
+        Ref: VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: phonebook-stage1-web-sg
+        - Key: Project
+          Value: phonebook-cloudformation-project
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL only from the Phonebook EC2 security group.
+      VpcId:
+        Ref: VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId:
+            Ref: WebSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: phonebook-stage1-db-sg
+        - Key: Project
+          Value: phonebook-cloudformation-project
+
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnets used by the Phonebook RDS database.
+      SubnetIds:
+        Ref: DBSubnetIds
+      Tags:
+        - Key: Project
+          Value: phonebook-cloudformation-project
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: mysql
+      DBInstanceClass:
+        Ref: DBInstanceClass
+      AllocatedStorage: "20"
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: phonebook_db
+      MasterUsername: phonebookadmin
+      ManageMasterUserPassword: true
+      Port: 3306
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 0
+      DeleteAutomatedBackups: true
+      DeletionProtection: false
+      AutoMinorVersionUpgrade: true
+      DBSubnetGroupName:
+        Ref: DatabaseSubnetGroup
+      VPCSecurityGroups:
+        - Fn::GetAtt:
+            - DatabaseSecurityGroup
+            - GroupId
+      Tags:
+        - Key: Name
+          Value: phonebook-stage1-db
+        - Key: Project
+          Value: phonebook-cloudformation-project
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ReadPhonebookSecrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - Ref: FlaskSecret
+                  - Fn::GetAtt:
+                      - Database
+                      - MasterUserSecret.SecretArn
+      Tags:
+        - Key: Project
+          Value: phonebook-cloudformation-project
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - Ref: EC2Role
+
+  WebInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId:
+        Ref: LatestAmiId
+      InstanceType:
+        Ref: InstanceType
+      IamInstanceProfile:
+        Ref: EC2InstanceProfile
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeleteOnTermination: true
+          DeviceIndex: "0"
+          GroupSet:
+            - Ref: WebSecurityGroup
+          SubnetId:
+            Ref: PublicSubnetId
+      Tags:
+        - Key: Name
+          Value: phonebook-stage1-web
+        - Key: Project
+          Value: phonebook-cloudformation-project
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #!/bin/bash
+            set -euo pipefail
+
+            dnf install -y git nginx jq python3.11 python3.11-pip
+
+            rm -rf /opt/phonebook-app
+            git clone --depth 1 "${GitRepoUrl}" /opt/phonebook-app
+
+            python3.11 -m venv /opt/phonebook-app/venv
+            /opt/phonebook-app/venv/bin/pip install --upgrade pip
+            /opt/phonebook-app/venv/bin/pip install -r /opt/phonebook-app/requirements.txt
+
+            chown -R ec2-user:ec2-user /opt/phonebook-app
+
+            cat > /usr/local/bin/phonebook-start.sh <<'SCRIPT'
+            #!/bin/bash
+            set -euo pipefail
+
+            DB_SECRET="$(aws secretsmanager get-secret-value \
+              --secret-id '${Database.MasterUserSecret.SecretArn}' \
+              --region '${AWS::Region}' \
+              --query SecretString \
+              --output text)"
+
+            export DB_HOST='${Database.Endpoint.Address}'
+            export DB_PORT='3306'
+            export DB_NAME='phonebook_db'
+            export DB_USER="$(printf '%s' "$DB_SECRET" | jq -r '.username')"
+            export DB_PASSWORD="$(printf '%s' "$DB_SECRET" | jq -r '.password')"
+            export DEVELOPER_NAME='Yazen Albu'
+            export APP_PORT='5000'
+            export FLASK_DEBUG='false'
+            export APP_SECRET_KEY="$(aws secretsmanager get-secret-value \
+              --secret-id '${FlaskSecret}' \
+              --region '${AWS::Region}' \
+              --query SecretString \
+              --output text)"
+
+            cd /opt/phonebook-app
+            /opt/phonebook-app/venv/bin/python /opt/phonebook-app/init_db.py
+
+            exec /opt/phonebook-app/venv/bin/gunicorn \
+              --workers 2 \
+              --bind 127.0.0.1:5000 \
+              app:app
+            SCRIPT
+
+            chmod 755 /usr/local/bin/phonebook-start.sh
+
+            cat > /etc/systemd/system/phonebook.service <<'SERVICE'
+            [Unit]
+            Description=Phonebook Flask application
+            Wants=network-online.target
+            After=network-online.target
+
+            [Service]
+            Type=simple
+            User=ec2-user
+            Group=ec2-user
+            WorkingDirectory=/opt/phonebook-app
+            ExecStart=/usr/local/bin/phonebook-start.sh
+            Restart=always
+            RestartSec=10
+
+            [Install]
+            WantedBy=multi-user.target
+            SERVICE
+
+            cat > /etc/nginx/nginx.conf <<'NGINX'
+            user nginx;
+            worker_processes auto;
+            error_log /var/log/nginx/error.log notice;
+            pid /run/nginx.pid;
+
+            events {
+                worker_connections 1024;
+            }
+
+            http {
+                include /etc/nginx/mime.types;
+                default_type application/octet-stream;
+                sendfile on;
+
+                server {
+                    listen 80 default_server;
+                    server_name _;
+
+                    location / {
+                        proxy_pass http://127.0.0.1:5000;
+                        proxy_set_header Host $host;
+                        proxy_set_header X-Real-IP $remote_addr;
+                        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                        proxy_set_header X-Forwarded-Proto $scheme;
+                    }
+                }
+            }
+            NGINX
+
+            nginx -t
+            systemctl daemon-reload
+            systemctl enable phonebook nginx
+            systemctl restart phonebook nginx
+
+Outputs:
+  WebsiteURL:
+    Description: Direct URL for the Stage 1 Phonebook website.
+    Value:
+      Fn::Sub: http://${WebInstance.PublicDnsName}
+
+  InstanceId:
+    Description: EC2 instance ID.
+    Value:
+      Ref: WebInstance
+
+  InstancePublicIp:
+    Description: EC2 public IPv4 address.
+    Value:
+      Fn::GetAtt:
+        - WebInstance
+        - PublicIp
+
+  RDSEndpoint:
+    Description: Private RDS endpoint.
+    Value:
+      Fn::GetAtt:
+        - Database
+        - Endpoint.Address
